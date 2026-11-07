@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+!.env.example
+chroma_db
+__pycache__
+.venv
+serviceAccountKey.json
+calendar_service_account.json

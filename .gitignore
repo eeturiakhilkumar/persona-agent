@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+serviceAccountKey.json
+calendar_service_account.json
+
+# Operating System & IDE artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Firebase
+.firebase/
+
+# Logs and databases
+*.log
+chroma_db/
+
+# Your personal documents (resume, notes) - keep them out of a public repo.
+# Only the sample bio is tracked; add others with `git add -f` if you really want to.
+knowledge/*
+!knowledge/summary.txt

@@ -1,0 +1,5 @@
+I am a Senior Software Engineer with over 8 years of experience architecting and building high-performance web applications, distributed systems, and modern AI-powered tools.
+
+My technical background spans full-stack development (Python, TypeScript, React, Node.js), cloud infrastructure (Docker, Kubernetes, AWS, GCP), and scalable database systems (PostgreSQL, Firestore, ChromaDB). Recently, my primary focus has been on agentic AI workflows, LLM application architecture, and autonomous developer tooling.
+
+In addition to leading software development efforts, I collaborate with tech startups and engineering teams on architecture reviews, freelance consulting, and MVP execution. I enjoy solving complex engineering challenges, designing reliable distributed systems, and shipping intuitive, production-ready software.
