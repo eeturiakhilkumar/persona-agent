@@ -59,6 +59,7 @@ python ingest.py
 ```bash
 python app.py
 ```
+<img width="2920" height="2852" alt="image" src="https://github.com/user-attachments/assets/5c415af1-9d3c-403f-bc6f-98241c639050" />
 
 Open <http://localhost:7860>. Done. 🎉
 
