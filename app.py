@@ -9,9 +9,8 @@ except ImportError:
 import os
 import time
 import json
+import threading
 import functools
-import requests
-import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import gradio as gr
@@ -20,13 +19,22 @@ from openai import OpenAI
 from config import (
     AGENT_NAME,
     BOOKING_HINT,
+    CHAT_MESSAGES_PER_IP,
+    CHAT_MESSAGES_PER_SESSION,
     CHROMA_PATH,
+    INGEST_RUNNING,
+    MAX_HISTORY_MESSAGES,
+    MAX_MESSAGE_CHARS,
+    USER_CALENDAR_URL,
+    USER_EMAIL,
     USER_NAME,
     USER_TITLE,
 )
 from ingest import run_ingestion
 from context import TWIN_SYSTEM_PROMPT
-from tools import tools, handle_tool_calls, db, log_session_turn
+from limits import RateLimiter
+from telegram_hitl import register_wait, finish_wait, poll_for_reply
+from tools import tools, handle_tool_calls, db, log_session_turn, set_escalation_status, redact_secrets
 from styles import (
     CSS,
     JS,
@@ -39,21 +47,29 @@ from styles import (
 )
 
 # --- STARTUP DIAGNOSTICS ---
+_has_pushover = bool(os.getenv('PUSHOVER_TOKEN') and os.getenv('PUSHOVER_USER'))
 print(f"\n=== {AGENT_NAME.upper()} STARTUP CHECK ===")
 print(f"Agent Name: {AGENT_NAME}")
 print(f"Representing: {USER_NAME} ({USER_TITLE})")
-print(f"OpenAI API Key: {'✅ Loaded' if os.getenv('OPENAI_API_KEY') else '❌ MISSING'}")
+print(f"OpenAI API Key: {'✅ Loaded' if os.getenv('OPENAI_API_KEY') else '❌ MISSING - set OPENAI_API_KEY in .env (cp .env.example .env)'}")
 print(f"Telegram Bot: {'✅ Loaded' if os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID') else '⚠️ Not configured (HITL disabled)'}")
-print(f"Pushover: {'✅ Loaded' if os.getenv('PUSHOVER_TOKEN') and os.getenv('PUSHOVER_USER') else '⚠️ Not configured'}")
+print(f"Pushover: {'✅ Loaded' if _has_pushover else '⚠️ Not configured'}")
 print(f"Database: {'✅ Firestore Connected' if db is not None else 'ℹ️ Local Logging Mode'}")
+if db is None and not _has_pushover:
+    print("⚠️  WARNING: neither Firestore nor Pushover is configured. Leads are only written to this log,")
+    print("    so you will NOT be notified of them. Configure at least one before going public.")
 print("===================================\n")
 
-# Build the knowledge index on first start (e.g. a fresh container) so deploys need no manual step.
+# Build the knowledge index on first start (e.g. a fresh container) in the background, so the server
+# starts listening right away. Searches report "still being prepared" until it finishes.
 if os.getenv("OPENAI_API_KEY") and not os.path.exists(CHROMA_PATH):
-    print("📚 No knowledge index found - building it from knowledge/ ...")
-    run_ingestion()
+    print("📚 No knowledge index found - building it from knowledge/ in the background ...")
+    INGEST_RUNNING.set()
+    threading.Thread(target=run_ingestion, daemon=True).start()
 
 MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+# OpenAI rejects an empty tools list, so only send tools when agent.yaml enables some.
+_TOOL_ARGS = {"tools": tools} if tools else {}
 
 @functools.lru_cache(maxsize=1)
 def get_openai_client():
@@ -63,7 +79,7 @@ def get_openai_client():
     try:
         return OpenAI(api_key=api_key)
     except Exception as e:
-        print(f"⚠️ OpenAI client initialization error: {e}")
+        print(f"⚠️ OpenAI client initialization error: {redact_secrets(e)}")
         return None
 
 def current_datetime_header() -> str:
@@ -82,108 +98,88 @@ def current_datetime_header() -> str:
         "Always confirm full date and time before booking."
     )
 
+# Shown to visitors instead of raw exception text, which can contain keys, URLs and internals.
+GENERIC_ERROR = "Sorry, something went wrong on my side. Please try again in a moment."
+UNAVAILABLE = "Chat is temporarily unavailable. " + (
+    f"You can book a call with {USER_NAME} at {USER_CALENDAR_URL}." if USER_CALENDAR_URL
+    else f"You can reach {USER_NAME} at {USER_EMAIL}." if USER_EMAIL
+    else "Please try again later."
+)
+MAX_CONCURRENT_CHATS = int(os.getenv("MAX_CONCURRENT_CHATS", "10"))
+
+_session_limiter = RateLimiter(CHAT_MESSAGES_PER_SESSION, 600)
+_ip_limiter = RateLimiter(CHAT_MESSAGES_PER_IP, 600)
+
 def build_system_messages():
     return [{"role": "system", "content": TWIN_SYSTEM_PROMPT + "\n\n" + current_datetime_header()}]
 
-UUID_RE = r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}'
+def _text_of(content) -> str:
+    """Gradio can hand back structured content; the model only needs the text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(_text_of(part) for part in content)
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or "")
+    return str(content or "")
 
-def check_telegram_for_reply(target_doc_id: str, offset=None):
-    """On-demand Telegram poll. Checks for a human reply to target_doc_id."""
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not bot_token:
-        return None, offset
+def clean_history(history) -> list:
+    """Only user/assistant text turns, only the most recent ones: bounds cost and drops stray roles/metadata."""
+    cleaned = [
+        {"role": turn["role"], "content": _text_of(turn.get("content"))}
+        for turn in (history or [])
+        if isinstance(turn, dict) and turn.get("role") in ("user", "assistant")
+    ]
+    return cleaned[-MAX_HISTORY_MESSAGES:]
 
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
-        params = {"timeout": 2, "allowed_updates": ["message"]}
-        if offset is not None:
-            params["offset"] = offset
+def _client_ip(request) -> str:
+    if request is None:
+        return "unknown"
+    forwarded = (getattr(request, "headers", None) or {}).get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return getattr(getattr(request, "client", None), "host", None) or "unknown"
 
-        resp = requests.get(url, params=params, timeout=5).json()
-        for update in resp.get("result", []):
-            offset = update["update_id"] + 1
-            message = update.get("message", {})
-            text = message.get("text", "")
-            if not text:
-                continue
+def chat(message, history, request: gr.Request = None):
+    # The gr.Request annotation is what makes Gradio pass the request in; without it session_hash is always None.
+    session_hash = getattr(request, "session_hash", None)
 
-            doc_id = None
-            answer = None
+    if not isinstance(message, str):
+        message = _text_of(message)
+    if len(message) > MAX_MESSAGE_CHARS:
+        yield f"That message is too long (limit {MAX_MESSAGE_CHARS} characters). Could you shorten it?"
+        return
+    if not (_session_limiter.allow(session_hash or "anon") and _ip_limiter.allow(_client_ip(request))):
+        yield "You're sending messages very quickly. Please wait a few minutes and try again."
+        return
 
-            # Strategy 1: Telegram native "Swipe to Reply"
-            if "reply_to_message" in message:
-                bot_text = message["reply_to_message"].get("text", "")
-                match = re.search(f'({UUID_RE})', bot_text)
-                if match:
-                    doc_id = match.group(1)
-                    answer = text
-
-            # Strategy 2: UUID prefix followed by answer
-            elif (match := re.search(f'^({UUID_RE})\\s+(.+)', text, re.DOTALL)):
-                doc_id = match.group(1)
-                answer = match.group(2)
-
-            # Strategy 3: Direct message from authorized user chat ID
-            else:
-                chat_id_env = os.getenv("TELEGRAM_CHAT_ID")
-                sender_id = str(message.get("chat", {}).get("id", ""))
-                if chat_id_env and sender_id == str(chat_id_env):
-                    doc_id = target_doc_id
-                    answer = text
-
-            if doc_id and answer:
-                print(f"📥 Caught human reply for {doc_id[:8]}... -> {answer}")
-                if db is not None:
-                    try:
-                        db.collection("escalations").document(doc_id).update({
-                            "status": "resolved",
-                            "reply": answer
-                        })
-                    except Exception as e:
-                        print(f"Firestore update failed: {e}")
-
-                if doc_id == target_doc_id:
-                    return answer, offset
-    except Exception as e:
-        print(f"⚠️ Telegram check error: {e}")
-
-    return None, offset
-
-def chat(message, history, request=None):
-    messages = build_system_messages() + history + [{"role": "user", "content": message}]
-    session_hash = getattr(request, "session_hash", None) if request is not None else None
+    messages = build_system_messages() + clean_history(history) + [{"role": "user", "content": message}]
     log_session_turn(session_hash, "user", message)
 
     client = get_openai_client()
     if not client:
-        err = (
-            "⚠️ **OpenAI API Key Missing**: Please set `OPENAI_API_KEY` in your `.env` file.\n\n"
-            "1. Copy `.env.example` to `.env`:\n"
-            "   `cp .env.example .env`\n"
-            "2. Open `.env` and set: `OPENAI_API_KEY=sk-...`\n"
-            "3. Restart the application: `python app.py`"
-        )
-        log_session_turn(session_hash, "assistant", err)
-        yield err
+        log_session_turn(session_hash, "assistant", UNAVAILABLE)
+        yield UNAVAILABLE
         return
-    
+
     try:
-        response = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=tools)
+        response = client.chat.completions.create(model=MODEL_NAME, messages=messages, **_TOOL_ARGS)
     except Exception as e:
-        err = f"System error: {str(e)}"
+        print(f"❌ OpenAI request failed: {redact_secrets(e)}")
+        err = GENERIC_ERROR
         log_session_turn(session_hash, "assistant", err)
         yield err
         return
-        
+
     max_tool_iterations = 5
     iterations = 0
-    
+
     while response.choices[0].finish_reason == "tool_calls" and iterations < max_tool_iterations:
         message_obj = response.choices[0].message
         tool_calls = message_obj.tool_calls
-        
-        results = handle_tool_calls(tool_calls)
-        
+
+        results = handle_tool_calls(tool_calls, session=session_hash)
+
         wait_doc_id = None
         wait_res = None
         for res in results:
@@ -192,74 +188,64 @@ def chat(message, history, request=None):
                 wait_doc_id = content.split(":", 1)[1]
                 wait_res = res
                 break
-                
+
         if wait_doc_id:
-            posted_msg = (
-                f"✅ Your message has been forwarded directly to {USER_NAME} via Telegram. 📱\n\n"
-                "Waiting for a quick reply (up to ~1 minute). "
-                "I'll display their response here as soon as it arrives!"
-            )
-            log_session_turn(session_hash, "assistant", posted_msg)
-            yield posted_msg
-
-            waited = 0
-            telegram_offset = None
-
+            register_wait(wait_doc_id)
             try:
-                bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-                if bot_token:
-                    seed_resp = requests.get(
-                        f"https://api.telegram.org/bot{bot_token}/getUpdates",
-                        params={"timeout": 0, "offset": -1},
-                        timeout=5
-                    ).json()
-                    seed_results = seed_resp.get("result", [])
-                    if seed_results:
-                        telegram_offset = seed_results[-1]["update_id"] + 1
-            except Exception:
-                pass
-
-            while waited < 20:
-                answer, telegram_offset = check_telegram_for_reply(wait_doc_id, telegram_offset)
-
-                if not answer and db is not None:
-                    try:
-                        doc = db.collection("escalations").document(wait_doc_id).get().to_dict()
-                        if doc and doc.get("status") == "resolved":
-                            answer = doc.get("reply")
-                    except Exception:
-                        pass
-
-                if answer:
-                    wait_res["content"] = json.dumps(f"{USER_NAME} replied: {answer}. Format this nicely for the visitor.")
-                    break
-
-                time.sleep(3)
-                waited += 1
-                if waited % 3 == 0 and waited < 20:
-                    progress_msg = (
-                        f"✅ Your message was sent to {USER_NAME}. 📱\n\n"
-                        f"Still waiting for a response (~{waited * 3}s elapsed). "
-                        "Thanks for your patience!"
-                    )
-                    log_session_turn(session_hash, "assistant", progress_msg)
-                    yield progress_msg
-
-            else:
-                wait_res["content"] = json.dumps(
-                    f"{USER_NAME} did not respond within 1 minute (likely in a meeting or away). "
-                    f"The visitor's inquiry WAS forwarded to {USER_NAME} and will be seen. "
-                    f"Apologize politely, explain {USER_NAME} is currently away, and offer to take their email "
-                    f"via record_user_details so {USER_NAME} can reply personally. {BOOKING_HINT}"
+                posted_msg = (
+                    f"✅ Your message has been forwarded directly to {USER_NAME} via Telegram. 📱\n\n"
+                    "Waiting for a quick reply (up to ~1 minute). "
+                    "I'll display their response here as soon as it arrives!"
                 )
-        
+                log_session_turn(session_hash, "assistant", posted_msg)
+                yield posted_msg
+
+                waited = 0
+                while waited < 20:
+                    answer = poll_for_reply(wait_doc_id)
+
+                    if not answer and db is not None:  # another instance may have caught the reply
+                        try:
+                            doc = db.collection("escalations").document(wait_doc_id).get().to_dict()
+                            if doc and doc.get("status") == "resolved":
+                                answer = doc.get("reply")
+                        except Exception:
+                            pass
+
+                    if answer:
+                        wait_res["content"] = json.dumps(f"{USER_NAME} replied: {answer}. Format this nicely for the visitor.")
+                        break
+
+                    time.sleep(3)
+                    waited += 1
+                    if waited % 3 == 0 and waited < 20:
+                        progress_msg = (
+                            f"✅ Your message was sent to {USER_NAME}. 📱\n\n"
+                            f"Still waiting for a response (~{waited * 3}s elapsed). "
+                            "Thanks for your patience!"
+                        )
+                        log_session_turn(session_hash, "assistant", progress_msg)
+                        yield progress_msg
+
+                else:
+                    set_escalation_status(wait_doc_id, "expired")
+                    wait_res["content"] = json.dumps(
+                        f"EXPIRED: The question was delivered to {USER_NAME} on Telegram, but no reply arrived within 1 minute, "
+                        f"and a late reply will NOT appear in this chat. Do not promise a reply time or say {USER_NAME} will answer here. "
+                        f"Apologize politely, explain {USER_NAME} seems to be away, and offer to take the visitor's email "
+                        f"via record_user_details so {USER_NAME} can reply personally. {BOOKING_HINT}"
+                    )
+            finally:
+                finish_wait(wait_doc_id)
+
         messages.append(message_obj)
         messages.extend(results)
-        
+
         try:
-            response = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=tools)
+            response = client.chat.completions.create(model=MODEL_NAME, messages=messages, **_TOOL_ARGS)
         except Exception as e:
-            err2 = f"System error during tool execution: {str(e)}"
+            print(f"❌ OpenAI request failed after tool call: {redact_secrets(e)}")
+            err2 = GENERIC_ERROR
             log_session_turn(session_hash, "assistant", err2)
             yield err2
             return
@@ -298,7 +284,10 @@ if __name__ == "__main__":
                         chatbot=gr.Chatbot(
                             show_label=False,
                             elem_classes="native-chatbot"
-                        )
+                        ),
+                        # Gradio's default is 1, which makes every visitor wait for the previous one
+                        # (a Telegram escalation alone can hold a slot for ~60s).
+                        concurrency_limit=MAX_CONCURRENT_CHATS,
                     )
 
         gr.HTML(FOOTER_HTML)

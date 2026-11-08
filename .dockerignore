@@ -2,8 +2,9 @@
 .env
 .env.*
 !.env.example
-chroma_db
 __pycache__
+chroma_db
 .venv
+tests
 serviceAccountKey.json
 calendar_service_account.json

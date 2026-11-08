@@ -4,7 +4,7 @@ import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from pypdf import PdfReader
 
-from config import KNOWLEDGE_DIR, CHROMA_PATH, COLLECTION_NAME, EMBED_MODEL
+from config import KNOWLEDGE_DIR, CHROMA_PATH, COLLECTION_NAME, EMBED_MODEL, INGEST_RUNNING
 
 def extract_text_from_file(filepath: str) -> str:
     ext = os.path.splitext(filepath)[1].lower()
@@ -26,6 +26,13 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str
     return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size - overlap)]
 
 def run_ingestion():
+    INGEST_RUNNING.set()
+    try:
+        _run_ingestion()
+    finally:
+        INGEST_RUNNING.clear()
+
+def _run_ingestion():
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print("❌ Error: OPENAI_API_KEY is not set. Add it to your .env file.")

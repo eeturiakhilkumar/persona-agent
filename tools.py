@@ -4,44 +4,83 @@ import requests
 import re
 import uuid
 import functools
+import threading
 from html import escape
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import firebase_admin
 from firebase_admin import credentials, firestore
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 from typing import Literal
 
 from config import (
+    AGENT,
     AGENT_NAME,
     BASE_DIR,
     BOOKING_HINT,
     CHROMA_PATH,
     COLLECTION_NAME,
     EMBED_MODEL,
+    INGEST_RUNNING,
+    MEETING_END_HOUR,
+    MEETING_MAX_DAYS_AHEAD,
+    MEETING_MAX_MINUTES,
+    MEETING_START_HOUR,
+    MEETING_WORKDAYS_ONLY,
     USER_NAME,
     USER_EMAIL,
     USER_CALENDAR_URL,
 )
+from limits import RateLimiter
+
+# Which visitor session the tool call belongs to (set by handle_tool_calls; tools run synchronously in that thread).
+_ctx = threading.local()
+
+def _session_key() -> str:
+    return getattr(_ctx, "session", None) or "anon"
+
+# Per-visitor and global ceilings so a public agent can't be used to spam you, your calendar or Telegram.
+_lead_limiter = RateLimiter(10, 3600)
+_escalation_session_limiter = RateLimiter(2, 1800)
+_escalation_global_limiter = RateLimiter(5, 3600)
+_meeting_session_limiter = RateLimiter(2, 3600)
+_meeting_global_limiter = RateLimiter(10, 3600)
+
+_SECRET_ENV_VARS = ("TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "PUSHOVER_TOKEN", "PUSHOVER_USER")
+
+def redact_secrets(value) -> str:
+    """Text safe to log: HTTP errors from `requests` embed the full URL, which for Telegram contains the bot token."""
+    text = str(value)
+    for name in _SECRET_ENV_VARS:
+        secret = os.getenv(name)
+        if secret and len(secret) >= 6:
+            text = text.replace(secret, "<redacted>")
+    text = re.sub(r"/bot\d+:[A-Za-z0-9_-]+", "/bot<redacted>", text)
+    return re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-<redacted>", text)
 
 pushover_user = os.getenv("PUSHOVER_USER")
 pushover_token = os.getenv("PUSHOVER_TOKEN")
 pushover_url = "https://api.pushover.net/1/messages.json"
 
 def push(message: str, title: str = f"{AGENT_NAME} Alert"):
+    """Send a Pushover alert. Returns True/False for delivered/failed, or None if Pushover isn't configured."""
     if not pushover_token or not pushover_user:
-        return
+        return None
     try:
-        requests.post(pushover_url, data={
+        resp = requests.post(pushover_url, data={
             "token": pushover_token,
             "user": pushover_user,
             "message": message,
             "title": title,
             "html": 1
         }, timeout=10)
+        if resp.status_code != 200:
+            print(f"Push notification rejected (HTTP {resp.status_code})")
+        return resp.status_code == 200
     except Exception as e:
-        print(f"Push notification failed: {e}")
+        print(f"Push notification failed: {redact_secrets(e)}")
+        return False
 
 # Initialize Firebase Admin SDK with graceful local fallback
 db = None
@@ -64,19 +103,75 @@ try:
 except Exception as e:
     print(f"ℹ️ Firebase initialization skipped ({e}). Operating in local logging mode.")
 
-def notify_and_store(collection_name: str, payload: dict, push_title: str, push_html_message: str):
+def notify_and_store(collection_name: str, payload: dict, push_title: str, push_html_message: str) -> str:
+    """Persist and announce a handoff. Returns what REALLY happened:
+    'delivered'      - saved to Firestore and/or the Pushover alert went out
+    'logged_locally' - no database or alerts configured; only the server log has it
+    'failed'         - a channel is configured but nothing got through
+    """
     payload["timestamp"] = datetime.now(timezone.utc).isoformat()
     payload["status"] = "new"
-    
+
+    stored = False
     if db is not None:
         try:
             db.collection(collection_name).add(payload)
+            stored = True
         except Exception as e:
             print(f"❌ Firestore Error: {str(e)}")
     else:
         print(f"📝 [Local Log - {collection_name}] {json.dumps(payload)}")
 
-    push(push_html_message, title=push_title)
+    notified = push(push_html_message, title=push_title)
+
+    if stored or notified:
+        return "delivered"
+    if db is None and notified is None:
+        return "logged_locally"
+    print(f"❌ Handoff FAILED for {collection_name}: {json.dumps(payload)}")
+    return "failed"
+
+def _handoff_result(outcome: str, ok_text: str) -> str:
+    """Turn a handoff outcome into a tool result the model cannot misread as success."""
+    if outcome == "delivered":
+        return f"OK: {ok_text}"
+    if outcome == "logged_locally":
+        return (
+            f"LOGGED_LOCALLY: The details were written to the server log only (no database or alerts are configured), "
+            f"so {USER_NAME} has NOT been notified. Tell the visitor their details were noted but do not promise a reply. {BOOKING_HINT}"
+        )
+    return (
+        f"NOT_SAVED: Saving and notifying {USER_NAME} failed. Do NOT tell the visitor their details were saved or that "
+        f"{USER_NAME} will follow up. Apologize briefly and point them to another way to reach {USER_NAME}. {BOOKING_HINT}"
+    )
+
+def _too_many_submissions():
+    """Return a NOT_SAVED message if this visitor session is submitting too much, else None."""
+    if _lead_limiter.allow(_session_key()):
+        return None
+    return (
+        "NOT_SAVED: This visitor has submitted too many forms in a short time. Do NOT claim anything was saved. "
+        f"Politely ask them to try again later. {BOOKING_HINT}"
+    )
+
+def _missing_info(what: str) -> str:
+    return f"NOT_SAVED: {what} Ask the visitor for it. Do not claim anything was saved."
+
+_EMPTY_VALUES = {"", "not provided", "name not provided", "unknown", "n/a", "none"}
+
+def _has_value(value) -> bool:
+    return str(value or "").strip().lower() not in _EMPTY_VALUES
+
+def set_escalation_status(escalation_id: str, status: str, **fields):
+    """Move an escalation through pending -> delivered -> resolved | expired (or failed), with a timestamp."""
+    if db is None:
+        return
+    try:
+        db.collection("escalations").document(escalation_id).update(
+            {"status": status, f"{status}_at": datetime.now(timezone.utc).isoformat(), **fields}
+        )
+    except Exception as e:
+        print(f"Escalation status update ({status}) failed: {e}")
 
 def log_session_turn(session_hash, role: str, content: str):
     """Append one chat turn to the per-session transcript record in Firestore if available."""
@@ -112,32 +207,53 @@ def log_session_turn(session_hash, role: str, content: str):
         print(f"⚠️ Session log failed: {e}")
 
 def record_user_details(email: str, name: str = "Name not provided", notes: str = "not provided"):
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", (email or "").strip()):
+        return _missing_info("A valid email address is required to record contact details.")
+    if (limited := _too_many_submissions()):
+        return limited
     payload = {"email": email, "name": name, "notes": notes}
     title = f"✉️ Contact Request for {USER_NAME}"
     msg = f"<b>Name:</b> {escape(name)}<br><b>Email:</b> {escape(email)}<br><b>Notes:</b> {escape(notes)}"
-    notify_and_store("general_contacts", payload, title, msg)
-    return "Contact details recorded successfully."
+    return _handoff_result(notify_and_store("general_contacts", payload, title, msg), "Contact details recorded successfully.")
 
 def record_unknown_question(question: str):
+    if not _has_value(question):
+        return _missing_info("The question text is empty.")
+    if (limited := _too_many_submissions()):
+        return limited
     payload = {"question": question}
     title = f"❓ Unknown Question for {USER_NAME}"
     msg = f"<b>Question:</b> {escape(question)}"
-    notify_and_store("unknown_questions", payload, title, msg)
-    return "Question logged for review."
+    return _handoff_result(notify_and_store("unknown_questions", payload, title, msg), "Question logged for review.")
 
-def log_recruiter_opportunity(company: str = "not provided", tech_stack: str = "not provided", compensation: str = "not provided", work_model: str = "Unknown", notes: str = "not provided"):
-    payload = {"company": company, "tech_stack": tech_stack, "compensation": compensation, "work_model": work_model, "notes": notes}
-    title = f"💼 Recruiter Lead for {USER_NAME}"
-    msg = f"<b>Company:</b> {escape(company)}<br><b>Stack:</b> {escape(tech_stack)}<br><b>Comp:</b> {escape(compensation)}<br><b>Model:</b> {escape(work_model)}<br><b>Notes:</b> {escape(notes)}"
-    notify_and_store("recruiter_leads", payload, title, msg)
-    return "Opportunity logged successfully."
+def _label(field_name: str) -> str:
+    return field_name.replace("_", " ").title()
 
-def capture_project_scope(problem_statement: str, budget: str = "not provided", timeline: str = "not provided"):
-    payload = {"problem_statement": problem_statement, "budget": budget, "timeline": timeline}
-    title = f"🚀 New Project Scope for {USER_NAME}"
-    msg = f"<b>Problem:</b> {escape(problem_statement)}<br><b>Budget:</b> {escape(budget)}<br><b>Timeline:</b> {escape(timeline)}"
-    notify_and_store("project_leads", payload, title, msg)
-    return "Project scope captured successfully."
+def _make_lead_tool(form: dict):
+    """Build the callable behind one `lead_forms` entry of agent.yaml."""
+    fields = form["fields"]
+
+    def lead_tool(**kwargs):
+        values = {}
+        for f in fields:
+            value = kwargs.get(f["name"], f["default"])
+            values[f["name"]] = value if isinstance(value, str) else str(value)
+        for f in fields:
+            value = values[f["name"]]
+            if f["required"] and not _has_value(value):
+                return _missing_info(f"'{_label(f['name'])}' is required.")
+            if f["min_chars"] and len(value.strip()) < f["min_chars"]:
+                return _missing_info(f"'{_label(f['name'])}' is missing or too short to be useful.")
+        if form["require_any"] and not any(_has_value(values[n]) for n in form["require_any"]):
+            return _missing_info(f"Not enough details were given (need at least one of: {', '.join(form['require_any'])}).")
+        if (limited := _too_many_submissions()):
+            return limited
+        title = f"{form['title']} for {USER_NAME}"
+        msg = "<br>".join(f"<b>{escape(_label(n))}:</b> {escape(v)}" for n, v in values.items())
+        return _handoff_result(notify_and_store(form["collection"], dict(values), title, msg), form["success_message"])
+
+    lead_tool.__name__ = form["name"]
+    return lead_tool
 
 @functools.lru_cache(maxsize=1)
 def _get_collection():
@@ -149,15 +265,23 @@ def _get_collection():
     return client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=embedding_function)
 
 def query_project_knowledge_base(query: str):
+    if INGEST_RUNNING.is_set():
+        return "The knowledge base is still being prepared. Answer from the profile summary and suggest asking again in a minute."
     if not os.path.exists(CHROMA_PATH):
         return "Knowledge base has not been initialized. No indexed documents found."
-    try:
-        results = _get_collection().query(query_texts=[query], n_results=3)
-        if not results["documents"] or not results["documents"][0]:
-            return "No relevant context found in the knowledge base."
-        return "\n\n---\n\n".join(results["documents"][0])
-    except Exception as e:
-        return f"Knowledge retrieval unavailable: {str(e)}"
+    for attempt in (1, 2):
+        try:
+            results = _get_collection().query(query_texts=[query], n_results=3)
+            if not results["documents"] or not results["documents"][0]:
+                return "No relevant context found in the knowledge base."
+            return "\n\n---\n\n".join(results["documents"][0])
+        except Exception as e:
+            if attempt == 1:
+                # `python ingest.py` replaces the collection, which invalidates our cached handle - reopen once.
+                _get_collection.cache_clear()
+                continue
+            print(f"Knowledge retrieval failed: {redact_secrets(e)}")
+            return "Knowledge retrieval is temporarily unavailable. Answer from the profile summary only and say you could not check the documents."
 
 def escalate_to_human(question: str):
     # Spam safeguard: check recent escalations if db exists
@@ -173,6 +297,14 @@ def escalate_to_human(question: str):
                 return f"{USER_NAME} is currently busy. Politely let the visitor know and ask for their email via record_user_details so {USER_NAME} can respond later.{booking_msg}"
         except Exception as e:
             print(f"Rate limit check failed: {e}")
+
+    if not _has_value(question):
+        return _missing_info("The question to forward is empty.")
+
+    # In-memory limits also protect you when Firestore isn't configured.
+    if not (_escalation_session_limiter.allow(_session_key()) and _escalation_global_limiter.allow("all")):
+        booking_msg = f" You can also schedule directly at {USER_CALENDAR_URL}" if USER_CALENDAR_URL else ""
+        return f"{USER_NAME} is currently busy. Politely let the visitor know and ask for their email via record_user_details so {USER_NAME} can respond later.{booking_msg}"
 
     escalation_id = str(uuid.uuid4())
     payload = {
@@ -206,14 +338,12 @@ def escalate_to_human(question: str):
             except Exception:
                 telegram_confirmed = resp.status_code == 200
         except Exception as e:
-            print(f"❌ Telegram Error: {str(e)}")
+            print(f"❌ Telegram Error: {redact_secrets(e)}")
 
-    if not telegram_confirmed:
-        if db is not None:
-            try:
-                db.collection("escalations").document(escalation_id).update({"status": "notification_failed"})
-            except Exception:
-                pass
+    if telegram_confirmed:
+        set_escalation_status(escalation_id, "delivered")
+    else:
+        set_escalation_status(escalation_id, "failed", failure="telegram_not_confirmed")
         booking_link = f" You can also book a call directly at {USER_CALENDAR_URL}." if USER_CALENDAR_URL else (f" You can reach {USER_NAME} directly at {USER_EMAIL}." if USER_EMAIL else "")
         return (
             f"Direct ping to {USER_NAME} is currently unavailable. Please explain that {USER_NAME} cannot be reached "
@@ -328,16 +458,56 @@ def schedule_google_calendar_meeting(attendee_email: str, attendee_name: str, to
     now = datetime.now(timezone.utc)
     if start_dt < now - timedelta(minutes=1):
         return f"The requested time {start_dt.strftime('%Y-%m-%d %H:%M %Z')} is in the past. Please ask for a future date and time."
-        
-    if not attendee_email or "@" not in attendee_email:
+    if start_dt > now + timedelta(days=MEETING_MAX_DAYS_AHEAD):
+        return f"Meetings can only be booked up to {MEETING_MAX_DAYS_AHEAD} days ahead. Ask the visitor for an earlier date."
+
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", (attendee_email or "").strip()):
         return "A valid attendee email address is required before scheduling. Please ask the visitor for their email."
-        
-    end_dt = start_dt + timedelta(minutes=duration_minutes or 30)
+    attendee_email = attendee_email.strip()
+
+    minutes = duration_minutes or 30
+    if not 15 <= minutes <= MEETING_MAX_MINUTES:
+        return f"Meetings must be between 15 and {MEETING_MAX_MINUTES} minutes. Ask the visitor to pick a length in that range."
+    end_dt = start_dt + timedelta(minutes=minutes)
+
+    # Only offer slots in the owner's working window (in MEETING_DEFAULT_TIMEZONE).
+    tz_name = os.getenv("MEETING_DEFAULT_TIMEZONE", "UTC")
+    local_start, local_end = start_dt.astimezone(ZoneInfo(tz_name)), end_dt.astimezone(ZoneInfo(tz_name))
+    minutes_of_day = lambda d: d.hour * 60 + d.minute
+    in_window = (
+        local_start.date() == local_end.date()
+        and minutes_of_day(local_start) >= MEETING_START_HOUR * 60
+        and minutes_of_day(local_end) <= MEETING_END_HOUR * 60
+    )
+    if not in_window or (MEETING_WORKDAYS_ONLY and local_start.weekday() >= 5):
+        days = "on weekdays " if MEETING_WORKDAYS_ONLY else ""
+        return (
+            f"{USER_NAME} only takes meetings {days}between {MEETING_START_HOUR:02d}:00 and {MEETING_END_HOUR:02d}:00 ({tz_name}). "
+            "Ask the visitor for a time inside that window."
+        )
+
+    if not (_meeting_session_limiter.allow(_session_key()) and _meeting_global_limiter.allow("all")):
+        return f"Too many booking attempts right now. Do not book anything. {booking_fallback}"
+
+    # These go into the invitation email, so keep them short and single-line.
+    attendee_name = " ".join((attendee_name or "Guest").split())[:80]
+    topic = " ".join((topic or "Intro call").split())[:200]
 
     try:
         service = get_calendar_service()
     except Exception as e:
         return f"Automated calendar booking is currently not configured ({str(e)[:120]}). {booking_fallback}"
+
+    try:
+        busy_info = service.freebusy().query(body={
+            "timeMin": start_dt.isoformat(),
+            "timeMax": end_dt.isoformat(),
+            "items": [{"id": calendar_id}],
+        }).execute()
+        if next(iter(busy_info.get("calendars", {}).values()), {}).get("busy"):
+            return f"{USER_NAME} is already busy at that time. Ask the visitor for another time."
+    except Exception as e:
+        print(f"Free/busy check skipped: {redact_secrets(e)}")
 
     event = {
         "summary": f"Meeting: {attendee_name} & {USER_NAME} - {topic}",
@@ -392,7 +562,7 @@ def schedule_google_calendar_meeting(attendee_email: str, attendee_name: str, to
 
         return (
             f"Successfully booked meeting for {start_dt.strftime('%A, %Y-%m-%d %H:%M %Z')} "
-            f"({duration_minutes or 30} min). Google Meet Link: {meet_link}. "
+            f"({minutes} min). Google Meet Link: {meet_link}. "
             f"A calendar invitation has been sent to {attendee_email} and {USER_NAME}."
         )
     except Exception as e:
@@ -408,22 +578,8 @@ class RecordUnknownQuestion(BaseModel):
     """Record a question you do not know the answer to so the user can review and update their knowledge base."""
     question: str
 
-class LogRecruiterOpportunity(BaseModel):
-    """Log details from a recruiter or hiring manager regarding a job opportunity. Call as soon as core facts exist."""
-    company: str = "not provided"
-    tech_stack: str = "not provided"
-    compensation: str = "not provided"
-    work_model: Literal["Remote", "Hybrid", "On-site", "Unknown"] = "Unknown"
-    notes: str = "not provided"
-
-class CaptureProjectScope(BaseModel):
-    """Log details for a potential client project, freelance inquiry, or technical collaboration. Call as soon as the problem statement is provided."""
-    problem_statement: str
-    budget: str = "not provided"
-    timeline: str = "not provided"
-
 class QueryProjectKnowledgeBase(BaseModel):
-    """Search the vector database for contextual information about the user's projects, background, and experience."""
+    """Search the vector database for contextual information about the user's background, work, documents and policies."""
     query: str
 
 class EscalateToHuman(BaseModel):
@@ -442,34 +598,49 @@ def _to_snake_case(name: str) -> str:
     s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
     return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
 
-def pydantic_to_openai_schema(model_class: type[BaseModel]) -> dict:
+def pydantic_to_openai_schema(model_class: type[BaseModel], name: str = None) -> dict:
     schema = model_class.model_json_schema()
-    name = _to_snake_case(model_class.__name__)
     parameters = {"type": "object", "properties": schema.get("properties", {}), "additionalProperties": False}
     if "required" in schema: parameters["required"] = schema["required"]
-    return {"type": "function", "function": {"name": name, "description": schema.get("description", ""), "parameters": parameters}}
+    return {"type": "function", "function": {
+        "name": name or _to_snake_case(model_class.__name__),
+        "description": schema.get("description", ""),
+        "parameters": parameters,
+    }}
 
-tools = [
-    pydantic_to_openai_schema(RecordUserDetails),
-    pydantic_to_openai_schema(RecordUnknownQuestion),
-    pydantic_to_openai_schema(LogRecruiterOpportunity),
-    pydantic_to_openai_schema(CaptureProjectScope),
-    pydantic_to_openai_schema(QueryProjectKnowledgeBase),
-    pydantic_to_openai_schema(EscalateToHuman),
-    pydantic_to_openai_schema(ScheduleGoogleCalendarMeeting)
-]
+def _form_model(form: dict) -> type[BaseModel]:
+    """Turn a `lead_forms` entry of agent.yaml into a pydantic model (and so a tool schema)."""
+    definitions = {}
+    for f in form["fields"]:
+        annotation = Literal[tuple(f["choices"])] if f["choices"] else str
+        description = f["description"] or None
+        default = ... if f["required"] else f["default"]
+        definitions[f["name"]] = (annotation, Field(default, description=description))
+    return create_model("".join(p.title() for p in form["name"].split("_")), __doc__=form["description"], **definitions)
 
-tool_map = {
-    "record_user_details": record_user_details,
-    "record_unknown_question": record_unknown_question,
-    "log_recruiter_opportunity": log_recruiter_opportunity,
-    "capture_project_scope": capture_project_scope,
-    "query_project_knowledge_base": query_project_knowledge_base,
-    "escalate_to_human": escalate_to_human,
-    "schedule_google_calendar_meeting": schedule_google_calendar_meeting
-}
+# Tools are assembled from agent.yaml: built-ins follow `features`, lead tools come from `lead_forms`.
+tools = []
+tool_map = {}
 
-def handle_tool_calls(tool_calls):
+def _register(model, func, name=None):
+    schema = pydantic_to_openai_schema(model, name)
+    tools.append(schema)
+    tool_map[schema["function"]["name"]] = func
+
+if AGENT["features"]["contact_capture"]:
+    _register(RecordUserDetails, record_user_details)
+    _register(RecordUnknownQuestion, record_unknown_question)
+for _form in AGENT["lead_forms"]:
+    _register(_form_model(_form), _make_lead_tool(_form), _form["name"])
+if AGENT["features"]["knowledge_base"]:
+    _register(QueryProjectKnowledgeBase, query_project_knowledge_base)
+if AGENT["features"]["escalation"]:
+    _register(EscalateToHuman, escalate_to_human)
+if AGENT["features"]["scheduling"]:
+    _register(ScheduleGoogleCalendarMeeting, schedule_google_calendar_meeting)
+
+def handle_tool_calls(tool_calls, session=None):
+    _ctx.session = session
     results = []
     for tool_call in tool_calls:
         tool_name = tool_call.function.name

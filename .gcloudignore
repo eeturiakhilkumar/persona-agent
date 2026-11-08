@@ -1,0 +1,13 @@
+# Used by `gcloud run deploy --source .` INSTEAD of .gitignore, so your git-ignored knowledge/ documents
+# are uploaded (the index is rebuilt at startup, so chroma_db/ is skipped) - but secrets are not.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+serviceAccountKey.json
+calendar_service_account.json
+chroma_db/
+__pycache__/
+.venv/
+tests/
