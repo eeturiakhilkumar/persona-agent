@@ -1,6 +1,9 @@
-"""Styling constants, CSS, and dynamic HTML partials for persona-agent."""
+"""Styling constants, CSS, and dynamic HTML partials. All copy comes from .env (who) and agent.yaml (what)."""
+import json
 from datetime import datetime
+from html import escape
 from config import (
+    AGENT,
     AGENT_NAME,
     USER_NAME,
     USER_TITLE,
@@ -8,41 +11,99 @@ from config import (
     USER_CALENDAR_URL,
     USER_LINKEDIN_URL,
     USER_GITHUB_URL,
+    PRIVACY_NOTICE,
     USER_SKILLS,
     get_user_initials,
     get_user_summary,
+    render,
 )
 
-initials = get_user_initials(USER_NAME)
+A = AGENT["agent"]
+FEATURES = AGENT["features"]
+
+# --- THEME: the stylesheet is written around one accent color; swap it for agent.theme_color ----------
+_DEFAULT_ACCENT = {"hex": "#d946ef", "rgb": "217, 70, 239", "light": "#e879f9", "gradient_from": "#f472b6"}
+
+def _mix_with_white(hex_color: str, amount: float) -> str:
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#{:02x}{:02x}{:02x}".format(*(round(c + (255 - c) * amount) for c in (r, g, b)))
+
+def _theme(text: str) -> str:
+    accent = A["theme_color"].lower()
+    r, g, b = (int(accent[i:i + 2], 16) for i in (1, 3, 5))
+    return (text.replace(_DEFAULT_ACCENT["rgb"], f"{r}, {g}, {b}")
+                .replace(_DEFAULT_ACCENT["hex"], accent)
+                .replace(_DEFAULT_ACCENT["light"], _mix_with_white(accent, 0.35))
+                .replace(_DEFAULT_ACCENT["gradient_from"], _mix_with_white(accent, 0.5)))
+
+# --- Text (everything inserted into HTML is escaped) ---------------------------------------------------
+def _e(text: str) -> str:
+    return escape(text)
+
+def _rich(text: str) -> str:
+    return _e(render(text)).replace("\n", "<br>")
+
+initials = _e(get_user_initials(USER_NAME))
 summary = get_user_summary()
 current_year = datetime.now().year
+name_e, title_e, location_e, agent_e = _e(USER_NAME), _e(USER_TITLE), _e(USER_LOCATION), _e(AGENT_NAME)
+who_e = f"{name_e} ({title_e})" if USER_TITLE else name_e
+
+# Four rotating accents/icons for sidebar cards, welcome bullets and suggestion chips.
+_COLORS = ["magenta", "blue", "green", "orange"]
+_ICONS = [
+    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline>',
+    '<rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>',
+    '<polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline>',
+    '<rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line>',
+]
+
+def _svg(index: int, size: int) -> str:
+    return (f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+            f'stroke-linecap="round" stroke-linejoin="round">{_ICONS[index % len(_ICONS)]}</svg>')
+
+# What the agent can do = the workflows from agent.yaml + the built-in capabilities that are switched on.
+capabilities = [(wf["title"], wf["tag"], render(wf["blurb"])) for wf in AGENT["workflows"]]
+if FEATURES["knowledge_base"]:
+    capabilities.append(("Knowledge & Background", "INFO", f"Ask specific questions about {USER_NAME} and get answers from their documents."))
+if FEATURES["scheduling"]:
+    capabilities.append(("Connect & Schedule", "CONNECT", "Book a meeting or leave contact details for a direct follow-up."))
+elif FEATURES["contact_capture"]:
+    capabilities.append(("Get in Touch", "CONTACT", "Leave your contact details for a direct follow-up."))
 
 # Render optional social / calendar links
 nav_links = []
 if USER_CALENDAR_URL:
     nav_links.append(f"""
-        <a href="{USER_CALENDAR_URL}" target="_blank" rel="noopener noreferrer" class="nav-btn-outline" style="text-decoration: none;">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+        <a href="{_e(USER_CALENDAR_URL)}" target="_blank" rel="noopener noreferrer" class="nav-btn-outline" style="text-decoration: none;">
+            {_svg(3, 14)}
             Book a Call
         </a>
     """)
 
 if USER_LINKEDIN_URL:
     nav_links.append(f"""
-        <a href="{USER_LINKEDIN_URL}" target="_blank" rel="noopener noreferrer" class="nav-btn-icon" aria-label="LinkedIn">
+        <a href="{_e(USER_LINKEDIN_URL)}" target="_blank" rel="noopener noreferrer" class="nav-btn-icon" aria-label="LinkedIn">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20.45 20.45h-3.55v-5.57c0-1.33-.03-3.04-1.85-3.04-1.86 0-2.14 1.45-2.14 2.94v5.67H9.35V9h3.41v1.56h.05c.47-.9 1.63-1.85 3.36-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28zM5.34 7.43a2.06 2.06 0 1 1 0-4.12 2.06 2.06 0 0 1 0 4.12zM7.12 20.45H3.55V9h3.57v11.45z"></path></svg>
         </a>
     """)
 
 if USER_GITHUB_URL:
     nav_links.append(f"""
-        <a href="{USER_GITHUB_URL}" target="_blank" rel="noopener noreferrer" class="nav-btn-icon" aria-label="GitHub">
+        <a href="{_e(USER_GITHUB_URL)}" target="_blank" rel="noopener noreferrer" class="nav-btn-icon" aria-label="GitHub">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
         </a>
     """)
 
 nav_links_html = "".join(nav_links)
-skills_chips_html = "".join([f"<span>{skill}</span>" for skill in USER_SKILLS])
+skills_chips_html = "".join(f"<span>{_e(skill)}</span>" for skill in USER_SKILLS)
+
+chips = []
+if USER_TITLE:
+    chips.append(f'<div class="highlight-chip"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d946ef" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg><span>{title_e}</span></div>')
+if USER_LOCATION:
+    chips.append(f'<div class="highlight-chip"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#06b6d4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg><span>{location_e}</span></div>')
+nav_chips_html = "".join(chips)
 
 # --- TOP NAVIGATION ---
 TOP_NAV_HTML = f"""
@@ -51,25 +112,18 @@ TOP_NAV_HTML = f"""
         <div class="nav-avatar">{initials}</div>
         <div class="nav-identity">
             <div class="nav-name-row">
-                <span class="nav-name">{USER_NAME}</span>
-                <span class="badge-pill magenta-badge">{AGENT_NAME}</span>
+                <span class="nav-name">{name_e}</span>
+                <span class="badge-pill magenta-badge">{agent_e}</span>
             </div>
             <div class="nav-status-row">
                 <span class="online-dot"></span>
-                <span class="nav-status">Online • Personal AI Agent</span>
+                <span class="nav-status">Online • {_e(A['tagline'])}</span>
             </div>
         </div>
     </div>
 
     <div class="nav-center">
-        <div class="highlight-chip">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d946ef" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
-            <span>{USER_TITLE}</span>
-        </div>
-        <div class="highlight-chip">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#06b6d4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-            <span>{USER_LOCATION}</span>
-        </div>
+        {nav_chips_html}
     </div>
 
     <div class="nav-right">
@@ -83,26 +137,56 @@ HERO_HTML = f"""
 <div class="hero-section">
     <div class="hero-pill">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.88 5.76a2 2 0 0 0 1.36 1.36L21 12l-5.76 1.88a2 2 0 0 0-1.36 1.36L12 21l-1.88-5.76a2 2 0 0 0-1.36-1.36L3 12l5.76-1.88a2 2 0 0 0 1.36-1.36L12 3z"></path></svg>
-        PERSONAL AI ASSISTANT
+        {_e(A['badge'])}
     </div>
-    <h1 class="hero-title">Meet <span class="text-gradient-magenta">{AGENT_NAME}</span></h1>
-    <p class="hero-subtitle">Personal AI agent representing <strong>{USER_NAME}</strong> ({USER_TITLE}).<br>Ask about technical projects, explore recruiter role fit, or discuss collaboration opportunities.</p>
+    <h1 class="hero-title">Meet <span class="text-gradient-magenta">{agent_e}</span></h1>
+    <p class="hero-subtitle">{_rich(A['hero_subtitle'])}</p>
 </div>
 """
 
 # --- LEFT SIDEBAR ---
+action_items = "".join(f"""
+            <div class="action-item">
+                <div class="icon-box {_COLORS[i % 4]}-box">{_svg(i, 18)}</div>
+                <div class="action-content">
+                    <div class="action-title-row">
+                        <h4>{_e(title)}</h4>
+                        <span class="tag tag-{_COLORS[i % 4]}">{_e(tag)}</span>
+                    </div>
+                    <p>{_e(blurb)}</p>
+                </div>
+            </div>
+""" for i, (title, tag, blurb) in enumerate(capabilities))
+
+skills_card = f"""
+    <!-- SKILLS -->
+    <div class="sidebar-card">
+        <div class="card-header">
+            <div class="header-left">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+                <h3>FOCUS AREAS</h3>
+            </div>
+            <span class="header-action">Topics</span>
+        </div>
+
+        <div class="tech-grid">
+            {skills_chips_html}
+        </div>
+    </div>
+""" if USER_SKILLS else ""
+
 LEFT_SIDEBAR_HTML = f"""
 <div class="sidebar-container">
-    <!-- USER PROFILE CARD -->
+    <!-- PROFILE CARD -->
     <div class="sidebar-card">
         <div class="card-header">
             <div class="header-left">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#d946ef" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4"></circle><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path></svg>
-                <h3>ABOUT {USER_NAME.upper()}</h3>
+                <h3>ABOUT {_e(USER_NAME.upper())}</h3>
             </div>
             <span class="header-action">Verified</span>
         </div>
-        <p class="sidebar-bio">{summary[:280]}...</p>
+        <p class="sidebar-bio">{_e(summary[:280])}...</p>
     </div>
 
     <!-- HOW I CAN HELP -->
@@ -116,66 +200,10 @@ LEFT_SIDEBAR_HTML = f"""
         </div>
 
         <div class="action-list">
-            <div class="action-item">
-                <div class="icon-box magenta-box"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg></div>
-                <div class="action-content">
-                    <div class="action-title-row">
-                        <h4>Projects & Scoping</h4>
-                        <span class="tag tag-magenta">PROJECTS</span>
-                    </div>
-                    <p>Discuss requirements, explore architecture feasibility, and capture project scopes.</p>
-                </div>
-            </div>
-
-            <div class="action-item">
-                <div class="icon-box blue-box"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg></div>
-                <div class="action-content">
-                    <div class="action-title-row">
-                        <h4>Recruiter & Career Fit</h4>
-                        <span class="tag tag-blue">RECRUITERS</span>
-                    </div>
-                    <p>Assess alignment for engineering roles, technical stack match, and experience.</p>
-                </div>
-            </div>
-
-            <div class="action-item">
-                <div class="icon-box green-box"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></div>
-                <div class="action-content">
-                    <div class="action-title-row">
-                        <h4>Knowledge & Background</h4>
-                        <span class="tag tag-green">INFO</span>
-                    </div>
-                    <p>Ask specific questions about technical background, past work, and experience.</p>
-                </div>
-            </div>
-
-            <div class="action-item">
-                <div class="icon-box orange-box"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg></div>
-                <div class="action-content">
-                    <div class="action-title-row">
-                        <h4>Connect & Schedule</h4>
-                        <span class="tag tag-orange">CONNECT</span>
-                    </div>
-                    <p>Schedule an introductory conversation or leave contact details.</p>
-                </div>
-            </div>
+{action_items}
         </div>
     </div>
-
-    <!-- SKILLS -->
-    <div class="sidebar-card">
-        <div class="card-header">
-            <div class="header-left">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
-                <h3>SKILLS & FOCUS</h3>
-            </div>
-            <span class="header-action">Technologies</span>
-        </div>
-
-        <div class="tech-grid">
-            {skills_chips_html}
-        </div>
-    </div>
+{skills_card}
 </div>
 """
 
@@ -184,7 +212,7 @@ CHAT_HEADER_HTML = f"""
 <div class="chat-header">
     <div class="chat-header-left">
         <span class="online-dot"></span>
-        <span class="chat-title">{AGENT_NAME.upper()} • {USER_NAME.upper()}</span>
+        <span class="chat-title">{_e(AGENT_NAME.upper())} • {_e(USER_NAME.upper())}</span>
     </div>
     <div class="chat-header-right">
         <span class="latency-badge">Online • Ready</span>
@@ -193,41 +221,38 @@ CHAT_HEADER_HTML = f"""
 """
 
 # --- INITIAL CHAT WELCOME BUBBLE ---
+welcome_items = "".join(f"""
+                <li><span class="mini-icon {_COLORS[i % 4]}-mini">{_svg(i, 14)}</span> <span><strong>{_e(title)}:</strong> {_e(blurb)}</span></li>""" for i, (title, _tag, blurb) in enumerate(capabilities))
+welcome_list = f"""<p><strong>Here is how I can assist you today:</strong></p>
+            <ul class="welcome-list">{welcome_items}
+            </ul>""" if capabilities else ""
+pills = "".join(f'\n        <button class="s-pill {_COLORS[i % 4]}-pill">{_svg(i, 14)} {_e(text)}</button>' for i, text in enumerate(AGENT["suggestions"]))
+pills_html = f'\n    <div class="suggestion-pills">{pills}\n    </div>' if pills else ""
+
 INITIAL_CHAT_HTML = f"""
 <div class="welcome-chat-container">
     <div class="chat-bubble bot-bubble">
         <div class="bot-avatar">{initials}</div>
         <div class="bubble-content">
-            <p>Hi there! 👋 I'm <strong>{AGENT_NAME}</strong>, the personal AI assistant for <strong>{USER_NAME}</strong> ({USER_TITLE}).</p>
-            <p><strong>About {USER_NAME}:</strong> {summary}</p>
-            <p><strong>Here is how I can assist you today:</strong></p>
-            <ul class="welcome-list">
-                <li><span class="mini-icon magenta-mini"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg></span> <span><strong>Projects & Consulting:</strong> Share requirements, discuss technical feasibility, or scope an upcoming project.</span></li>
-                <li><span class="mini-icon blue-mini"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg></span> <span><strong>Recruiter Inquiries:</strong> Explore {USER_NAME}'s background, skills, and evaluate alignment for career roles.</span></li>
-                <li><span class="mini-icon green-mini"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></span> <span><strong>Technical Background:</strong> Ask questions about past work, engineering decisions, and core competencies.</span></li>
-                <li><span class="mini-icon orange-mini"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg></span> <span><strong>Scheduling & Contact:</strong> Book a consultation or leave contact details for a direct follow-up.</span></li>
-            </ul>
+            <p>{_e(render(A['greeting']))}</p>
+            <p><strong>About {name_e}:</strong> {_e(summary)}</p>
+            {welcome_list}
             <p>What would you like to discuss?</p>
         </div>
     </div>
-
-    <div class="suggestion-pills">
-        <button class="s-pill magenta-pill"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg> Discuss a Project</button>
-        <button class="s-pill blue-pill"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg> Recruiter & Role Fit</button>
-        <button class="s-pill green-pill"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg> Ask About Background</button>
-        <button class="s-pill orange-pill"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg> Schedule a Meeting</button>
-    </div>
+{pills_html}
 </div>
 """
 
 # --- FOOTER ---
 FOOTER_HTML = f"""
 <div class="page-footer">
-    <div class="footer-left">© {current_year} {USER_NAME} • Powered by {AGENT_NAME}</div>
+    <div class="footer-left">© {current_year} {name_e} • Powered by {agent_e}</div>
     <div class="footer-right">
-        <span>Personal AI Representative</span>
+        <span>{_e(A['tagline'])}</span>
     </div>
 </div>
+<p class="privacy-note">{_e(PRIVACY_NOTICE)}</p>
 """
 
 CSS = """
@@ -432,11 +457,12 @@ button.submit { background: #d946ef !important; border-radius: 8px !important; m
 /* FOOTER */
 .page-footer { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-top: 1px solid rgba(255,255,255,0.06); color: #94a3b8; font-size: 12px; margin-top: auto; }
 .page-footer a { color: #cbd5e1; text-decoration: none; }
+.privacy-note { color: #64748b; font-size: 11px; text-align: center; margin: 4px 0 12px; }
 """
 
 JS = """
 () => {
-  document.title = 'persona-agent';
+  document.title = __AGENT_TITLE__;
 
   setTimeout(() => {
     const areas = document.querySelectorAll('textarea');
@@ -474,3 +500,10 @@ JS = """
   }, 100);
 }
 """
+
+# Apply the accent color to the stylesheet and to the inline-colored HTML, and the agent name to the page title.
+CSS = _theme(CSS)
+JS = JS.replace("__AGENT_TITLE__", json.dumps(AGENT_NAME))
+TOP_NAV_HTML, HERO_HTML, LEFT_SIDEBAR_HTML, CHAT_HEADER_HTML, INITIAL_CHAT_HTML, FOOTER_HTML = (
+    _theme(h) for h in (TOP_NAV_HTML, HERO_HTML, LEFT_SIDEBAR_HTML, CHAT_HEADER_HTML, INITIAL_CHAT_HTML, FOOTER_HTML)
+)
